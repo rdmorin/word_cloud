@@ -27,7 +27,10 @@ from PIL import ImageDraw
 from PIL import ImageFilter
 from PIL import ImageFont
 
-from .query_integral_image import query_integral_image
+try:
+    from .query_integral_image import query_integral_image
+except Exception:
+    from .query_integral_image_py import query_integral_image
 from .tokenization import unigrams_and_bigrams, process_tokens
 
 FILE = os.path.dirname(__file__)
@@ -50,6 +53,40 @@ class IntegralOccupancyMap(object):
     def sample_position(self, size_x, size_y, random_state):
         return query_integral_image(self.integral, size_x, size_y,
                                     random_state)
+
+    def _is_empty(self, pos_x, pos_y, size_x, size_y):
+        # Check bounds (match cython iteration logic: i in [0, x - size_x))
+        if (pos_x < 0 or pos_y < 0 or
+                pos_x + size_x >= self.height or
+                pos_y + size_y >= self.width):
+            return False
+        area = (self.integral[pos_x, pos_y]
+                + self.integral[pos_x + size_x, pos_y + size_y]
+                - self.integral[pos_x + size_x, pos_y]
+                - self.integral[pos_x, pos_y + size_y])
+        return area == 0
+
+    def sample_position_spiral(self, size_x, size_y, random_state):
+        # Spiral from center outward using golden-angle steps.
+        center_x = (self.height - size_x) // 2
+        center_y = (self.width - size_y) // 2
+        max_r = max(self.height, self.width)
+        theta = random_state.random() * 2 * np.pi
+        golden_angle = np.pi * (3 - np.sqrt(5))  # ~2.399963
+        step = golden_angle
+        seen = set()
+        r = 0.0
+        while r < max_r:
+            pos_x = int(center_x + r * np.sin(theta))
+            pos_y = int(center_y + r * np.cos(theta))
+            key = (pos_x, pos_y)
+            if key not in seen:
+                seen.add(key)
+                if self._is_empty(pos_x, pos_y, size_x, size_y):
+                    return pos_x, pos_y
+            theta += step
+            r += 0.5 * max(self.height, self.width) / 200.0
+        return self.sample_position(size_x, size_y, random_state)
 
     def update(self, img_array, pos_x, pos_y):
         partial_integral = np.cumsum(np.cumsum(img_array[pos_x:, pos_y:],
@@ -315,7 +352,8 @@ class WordCloud(object):
                  relative_scaling='auto', regexp=None, collocations=True,
                  colormap=None, normalize_plurals=True, contour_width=0,
                  contour_color='black', repeat=False,
-                 include_numbers=False, min_word_length=0, collocation_threshold=30):
+                 include_numbers=False, min_word_length=0, collocation_threshold=30,
+                 placement_mode='random'):
         if font_path is None:
             font_path = FONT_PATH
         if color_func is None and colormap is None:
@@ -331,6 +369,7 @@ class WordCloud(object):
         self.height = height
         self.margin = margin
         self.prefer_horizontal = prefer_horizontal
+        self.placement_mode = placement_mode
         self.mask = mask
         self.contour_color = contour_color
         self.contour_width = contour_width
@@ -511,9 +550,28 @@ class WordCloud(object):
                 # get size of resulting text
                 box_size = draw.textbbox((0, 0), word, font=transposed_font, anchor="lt")
                 # find possible places using integral image:
-                result = occupancy.sample_position(box_size[3] + self.margin,
-                                                   box_size[2] + self.margin,
-                                                   random_state)
+                if self.placement_mode == "spiral":
+                    result = occupancy.sample_position_spiral(
+                        box_size[3] + self.margin,
+                        box_size[2] + self.margin,
+                        random_state)
+                elif self.placement_mode == "spiral_fill":
+                    # Use spiral for larger words, random for smaller ones.
+                    if freq >= 0.35:
+                        result = occupancy.sample_position_spiral(
+                            box_size[3] + self.margin,
+                            box_size[2] + self.margin,
+                            random_state)
+                    else:
+                        result = occupancy.sample_position(
+                            box_size[3] + self.margin,
+                            box_size[2] + self.margin,
+                            random_state)
+                else:
+                    result = occupancy.sample_position(
+                        box_size[3] + self.margin,
+                        box_size[2] + self.margin,
+                        random_state)
                 if result is not None:
                     # Found a place
                     break
@@ -528,8 +586,8 @@ class WordCloud(object):
                     orientation = None
 
             if font_size < self.min_font_size:
-                # we were unable to draw any more
-                break
+                # we were unable to draw this word; skip it and continue
+                continue
 
             x, y = np.array(result) + self.margin // 2
             # actually draw the text
