@@ -92,27 +92,61 @@ class IntegralOccupancyMap(object):
                 - self.integral[pos_x, pos_y + size_y])
         return area == 0
 
-    def sample_position_spiral(self, size_x, size_y, random_state, max_iters=None):
-        # Spiral from center outward using golden-angle steps.
+    def sample_position_spiral(self, size_x, size_y, random_state, max_iters=None, outside_in=False,
+                               center_mode='center'):
+        # Spiral using golden-angle steps; either center-out or outside-in.
         if self.mask_bounds is not None:
             min_x, min_y, max_x, max_y = self.mask_bounds
             center_x = (min_x + max_x) // 2
             center_y = (min_y + max_y) // 2
+            span_x = max_x - min_x
+            span_y = max_y - min_y
             max_r = max(max_x - min_x, max_y - min_y) + max(size_x, size_y)
         else:
             center_x = (self.height - size_x) // 2
             center_y = (self.width - size_y) // 2
+            span_x = self.height - size_x
+            span_y = self.width - size_y
             max_r = max(self.height, self.width)
+        quarter_dx = max(1, int(span_x * 0.25))
+        quarter_dy = max(1, int(span_y * 0.25))
+        if center_mode == 'nw':
+            center_x -= quarter_dx
+            center_y -= quarter_dy
+        elif center_mode == 'ne':
+            center_x -= quarter_dx
+            center_y += quarter_dy
+        elif center_mode == 'sw':
+            center_x += quarter_dx
+            center_y -= quarter_dy
+        elif center_mode == 'se':
+            center_x += quarter_dx
+            center_y += quarter_dy
+        elif center_mode == 'nc':
+            center_x -= quarter_dx
+        elif center_mode == 'sc':
+            center_x += quarter_dx
+        elif center_mode == 'wc':
+            center_y -= quarter_dy
+        elif center_mode == 'ec':
+            center_y += quarter_dy
         theta = random_state.random() * 2 * np.pi
         golden_angle = np.pi * (3 - np.sqrt(5))  # ~2.399963
         step = golden_angle
         seen = set()
-        r = 0.0
         self.attempts_last = 0
         self.spiral_iters_last = 0
         iters = 0
         step_r = 0.5 * max_r / 200.0
-        while r < max_r:
+        if outside_in:
+            r = max_r
+            keep_going = lambda radius: radius >= 0.0
+            advance_r = lambda radius: radius - step_r
+        else:
+            r = 0.0
+            keep_going = lambda radius: radius < max_r
+            advance_r = lambda radius: radius + step_r
+        while keep_going(r):
             if max_iters is not None and iters >= max_iters:
                 self.spiral_iters_last = iters
                 self.spiral_iters_total += iters
@@ -134,7 +168,7 @@ class IntegralOccupancyMap(object):
                     self.spiral_iters_total += iters
                     return pos_x, pos_y
             theta += step
-            r += step_r
+            r = advance_r(r)
         self.spiral_iters_total += iters
         self.spiral_iters_last = iters
         return self.sample_position(size_x, size_y, random_state)
@@ -405,8 +439,11 @@ class WordCloud(object):
                  contour_color='black', repeat=False,
                  include_numbers=False, min_word_length=0, collocation_threshold=30,
                  placement_mode='random', rotation_angles=None, box_padding=0,
+                 box_overlap=0,
                  max_spiral_iters_per_word=150, max_random_tries_per_word=200,
-                 fallback_mode='random'):
+                 fallback_mode='random', max_total_spiral_iters=100000,
+                 font_size_mode='relative', frequency_order='sorted',
+                 spiral_center='center'):
         if font_path is None:
             font_path = FONT_PATH
         if color_func is None and colormap is None:
@@ -422,12 +459,17 @@ class WordCloud(object):
         self.height = height
         self.margin = margin
         self.box_padding = box_padding
+        self.box_overlap = box_overlap
         self.prefer_horizontal = prefer_horizontal
         self.placement_mode = placement_mode
         self.rotation_angles = rotation_angles
         self.max_spiral_iters_per_word = max_spiral_iters_per_word
         self.max_random_tries_per_word = max_random_tries_per_word
         self.fallback_mode = fallback_mode
+        self.max_total_spiral_iters = max_total_spiral_iters
+        self.font_size_mode = font_size_mode
+        self.frequency_order = frequency_order
+        self.spiral_center = spiral_center
         self.mask = mask
         self.contour_color = contour_color
         self.contour_width = contour_width
@@ -455,6 +497,15 @@ class WordCloud(object):
             raise ValueError("relative_scaling needs to be "
                              "between 0 and 1, got %f." % relative_scaling)
         self.relative_scaling = relative_scaling
+        if self.font_size_mode not in ('relative', 'absolute'):
+            raise ValueError("font_size_mode needs to be 'relative' or 'absolute', got %r."
+                             % self.font_size_mode)
+        if self.frequency_order not in ('sorted', 'sorted-reverse', 'input'):
+            raise ValueError("frequency_order needs to be 'sorted', 'sorted-reverse', or 'input', got %r."
+                             % self.frequency_order)
+        if self.spiral_center not in ('center', 'nw', 'ne', 'sw', 'se', 'nc', 'sc', 'wc', 'ec'):
+            raise ValueError("spiral_center needs to be one of 'center', 'nw', 'ne', 'sw', 'se', 'nc', 'sc', 'wc', 'ec', got %r."
+                             % self.spiral_center)
         if ranks_only is not None:
             warnings.warn("ranks_only is deprecated and will be removed as"
                           " it had no effect. Look into relative_scaling.",
@@ -502,8 +553,13 @@ class WordCloud(object):
         self
 
         """
-        # make sure frequencies are sorted and normalized
-        frequencies = sorted(frequencies.items(), key=itemgetter(1), reverse=True)
+        # order frequencies either by value or preserve caller order
+        if self.frequency_order == 'input':
+            frequencies = list(frequencies.items())
+        elif self.frequency_order == 'sorted-reverse':
+            frequencies = sorted(frequencies.items(), key=itemgetter(1), reverse=False)
+        else:
+            frequencies = sorted(frequencies.items(), key=itemgetter(1), reverse=True)
         if len(frequencies) <= 0:
             raise ValueError("We need at least 1 word to plot a word cloud, "
                              "got %d." % len(frequencies))
@@ -586,14 +642,24 @@ class WordCloud(object):
                                     for word, freq in frequencies_org])
 
         # start drawing grey image
+        stop_early = False
         for word, freq in frequencies:
+            if (self.max_total_spiral_iters is not None and
+                    spiral_iters_total >= self.max_total_spiral_iters):
+                stop_early = True
+                break
             if freq == 0:
                 continue
             # select the font size
-            rs = self.relative_scaling
-            if rs != 0:
-                font_size = int(round((rs * (freq / float(last_freq))
-                                       + (1 - rs)) * font_size))
+            if self.font_size_mode == 'absolute':
+                min_fs = max(1, int(self.min_font_size))
+                max_fs = max(min_fs, int(max_font_size))
+                font_size = int(round(min_fs + freq * (max_fs - min_fs)))
+            else:
+                rs = self.relative_scaling
+                if rs != 0:
+                    font_size = int(round((rs * (freq / float(last_freq))
+                                           + (1 - rs)) * font_size))
             # pick orientation / angle
             angle = None
             orientation = None
@@ -703,42 +769,67 @@ class WordCloud(object):
                                         box_size[3] + 2 * pad_box)
 
                     # find possible places using integral image:
+                    occ_h = max(1, box_size[3] + self.margin - int(self.box_overlap))
+                    occ_w = max(1, box_size[2] + self.margin - int(self.box_overlap))
+
                     if self.placement_mode == "spiral":
                         result = occupancy.sample_position_spiral(
-                            box_size[3] + self.margin,
-                            box_size[2] + self.margin,
+                            occ_h,
+                            occ_w,
                             random_state,
-                            max_iters=self.max_spiral_iters_per_word)
+                            max_iters=self.max_spiral_iters_per_word,
+                            center_mode=self.spiral_center)
                         if result is None and self.fallback_mode == "random":
                             result = occupancy.sample_position_bounded_random(
-                                box_size[3] + self.margin,
-                                box_size[2] + self.margin,
+                                occ_h,
+                                occ_w,
+                                random_state,
+                                self.max_random_tries_per_word)
+                    elif self.placement_mode == "spiral_outside_in":
+                        result = occupancy.sample_position_spiral(
+                            occ_h,
+                            occ_w,
+                            random_state,
+                            max_iters=self.max_spiral_iters_per_word,
+                            outside_in=True,
+                            center_mode=self.spiral_center)
+                        if result is None and self.fallback_mode == "random":
+                            result = occupancy.sample_position_bounded_random(
+                                occ_h,
+                                occ_w,
                                 random_state,
                                 self.max_random_tries_per_word)
                     elif self.placement_mode == "spiral_fill":
                         # Use spiral for larger words, random for smaller ones.
                         if freq >= 0.35:
                             result = occupancy.sample_position_spiral(
-                                box_size[3] + self.margin,
-                                box_size[2] + self.margin,
+                                occ_h,
+                                occ_w,
                                 random_state,
-                                max_iters=self.max_spiral_iters_per_word)
+                                max_iters=self.max_spiral_iters_per_word,
+                                center_mode=self.spiral_center)
                             if result is None and self.fallback_mode == "random":
                                 result = occupancy.sample_position_bounded_random(
-                                    box_size[3] + self.margin,
-                                    box_size[2] + self.margin,
+                                    occ_h,
+                                    occ_w,
                                     random_state,
                                     self.max_random_tries_per_word)
                         else:
                             result = occupancy.sample_position(
-                                box_size[3] + self.margin,
-                                box_size[2] + self.margin,
+                                occ_h,
+                                occ_w,
                                 random_state)
                     else:
                         result = occupancy.sample_position(
-                            box_size[3] + self.margin,
-                            box_size[2] + self.margin,
+                            occ_h,
+                            occ_w,
                             random_state)
+
+                    spiral_iters_total = getattr(occupancy, "spiral_iters_total", spiral_iters_total)
+                    if (self.max_total_spiral_iters is not None and
+                            spiral_iters_total >= self.max_total_spiral_iters):
+                        stop_early = True
+                        result = None
 
                     if result is not None:
                         # Found a place
@@ -747,18 +838,24 @@ class WordCloud(object):
                         placed = True
                         # count failed attempts before success (spiral has attempt counter)
                         failed_attempts += max(0, getattr(occupancy, "attempts_last", 0) - 1)
-                        spiral_iters_total = getattr(occupancy, "spiral_iters_total", spiral_iters_total)
                         spiral_iters_per_word.append(getattr(occupancy, "spiral_iters_last", 0))
                         break
                     else:
                         failed_attempts += 1
+                        if stop_early:
+                            break
 
                 if placed:
+                    break
+                if stop_early:
                     break
 
                 # if we didn't find a place, make font smaller
                 font_size -= self.font_step
                 orientation = None
+
+            if stop_early:
+                break
 
             if font_size < self.min_font_size:
                 # we were unable to draw this word; skip it and continue
@@ -793,9 +890,13 @@ class WordCloud(object):
 
         self.layout_ = list(zip(frequencies, font_sizes, positions,
                                 orientations, colors))
+        self.font_sizes_ = list(font_sizes)
+        self.positions_ = list(positions)
+        self.orientations_ = list(orientations)
         self.failed_placement_attempts_ = failed_attempts
         self.spiral_iters_total_ = spiral_iters_total
         self.spiral_iters_per_word_ = spiral_iters_per_word
+        self.stopped_early_ = stop_early
         return self
 
     def process_text(self, text):
@@ -890,8 +991,7 @@ class WordCloud(object):
             raise ValueError("WordCloud has not been calculated, call generate"
                              " first.")
 
-    def to_image(self):
-        self._check_generated()
+    def _layout_to_image(self, layout):
         if self.mask is not None:
             width = self.mask.shape[1]
             height = self.mask.shape[0]
@@ -902,62 +1002,244 @@ class WordCloud(object):
                                     int(height * self.scale)),
                         self.background_color)
         draw = ImageDraw.Draw(img)
+        guide_fill = getattr(self, "color_guide_fill_", None)
+        guide_alpha_by_word = getattr(self, "color_guide_fill_alpha_by_word_", None)
+        if guide_fill is not None:
+            guide_fill = guide_fill.convert("RGBA").resize(img.size, Image.LANCZOS)
+            guide_arr = np.asarray(guide_fill)
         pad_box = int(self.box_padding * self.scale) if self.box_padding else 0
-        for (word, count), font_size, position, orientation, color in self.layout_:
-            font = ImageFont.truetype(self.font_path,
-                                      int(font_size * self.scale))
+        for (word, count), font_size, position, orientation, color in layout:
             pos = (int(position[1] * self.scale),
                    int(position[0] * self.scale))
-            if isinstance(orientation, (float, np.floating)):
-                angle = orientation
-                bbox = draw.textbbox((0, 0), word, font=font, anchor="lt")
-                w = bbox[2] - bbox[0]
-                h = bbox[3] - bbox[1]
-                try:
-                    ascent, descent = font.getmetrics()
-                    extra = int(descent * self.scale)
-                except Exception:
-                    extra = 0
-                pad = max(4, int(font_size * self.scale * 0.4) + extra)
-                txt = Image.new("RGBA", (w + 2 * pad, h + 2 * pad), (0, 0, 0, 0))
-                txt_draw = ImageDraw.Draw(txt)
-                txt_draw.text((pad, pad), word, fill=color, font=font)
-                rotated = txt.rotate(angle, expand=True, resample=Image.BICUBIC)
-                rotated_mask = rotated.split()[-1]
-                rotated_mask = rotated_mask.point(lambda v: 255 if v > 0 else 0)
-                bbox_inner = rotated_mask.getbbox()
-                if bbox_inner:
-                    rotated = rotated.crop(bbox_inner)
-                    rotated_mask = rotated_mask.crop(bbox_inner)
-                if pad_box:
-                    rotated = ImageOps.expand(rotated, border=pad_box, fill=(0, 0, 0, 0))
-                    rotated_mask = ImageOps.expand(rotated_mask, border=pad_box, fill=0)
-                img.paste(rotated, pos, rotated_mask)
-            elif isinstance(orientation, (int, np.integer)) or orientation is None:
-                transposed_font = ImageFont.TransposedFont(
-                    font, orientation=orientation)
-                if pad_box:
-                    draw.text((pos[0] + pad_box, pos[1] + pad_box), word, fill=color, font=transposed_font)
-                else:
-                    draw.text(pos, word, fill=color, font=transposed_font)
+            if guide_fill is not None:
+                stamp = self._render_layout_entry_rgba(word, font_size, orientation, (255, 255, 255, 255))
+                alpha = np.asarray(stamp.split()[-1], dtype=np.float32)
+                if guide_alpha_by_word is not None:
+                    alpha *= float(guide_alpha_by_word.get(word, 1.0))
+                alpha = np.clip(alpha, 0, 255).astype(np.uint8)
+                x0 = max(0, pos[0])
+                y0 = max(0, pos[1])
+                x1 = min(img.size[0], pos[0] + stamp.size[0])
+                y1 = min(img.size[1], pos[1] + stamp.size[1])
+                if x1 > x0 and y1 > y0:
+                    ax0 = x0 - pos[0]
+                    ay0 = y0 - pos[1]
+                    ax1 = ax0 + (x1 - x0)
+                    ay1 = ay0 + (y1 - y0)
+                    fill_crop = guide_arr[y0:y1, x0:x1].copy()
+                    alpha_crop = alpha[ay0:ay1, ax0:ax1]
+                    fill_crop[:, :, 3] = np.minimum(fill_crop[:, :, 3], alpha_crop)
+                    stamp_rgba = Image.fromarray(fill_crop, mode="RGBA")
+                    img.paste(stamp_rgba, (x0, y0), stamp_rgba)
             else:
-                # orientation is a float angle in degrees (add padding to avoid clipping)
-                bbox = draw.textbbox((0, 0), word, font=font, anchor="lt")
-                w = bbox[2] - bbox[0]
-                h = bbox[3] - bbox[1]
-                try:
-                    ascent, descent = font.getmetrics()
-                    extra = int(descent * self.scale)
-                except Exception:
-                    extra = 0
-                pad = max(4, int(font_size * self.scale * 0.4) + extra)
-                txt = Image.new("RGBA", (w + 2 * pad, h + 2 * pad), (0, 0, 0, 0))
-                txt_draw = ImageDraw.Draw(txt)
-                txt_draw.text((pad, pad), word, fill=color, font=font)
-                rotated = txt.rotate(orientation, expand=True, resample=Image.BICUBIC)
-                img.paste(rotated, pos, rotated)
+                font = ImageFont.truetype(self.font_path,
+                                          int(font_size * self.scale))
+                if isinstance(orientation, (float, np.floating)):
+                    angle = orientation
+                    bbox = draw.textbbox((0, 0), word, font=font, anchor="lt")
+                    w = bbox[2] - bbox[0]
+                    h = bbox[3] - bbox[1]
+                    try:
+                        ascent, descent = font.getmetrics()
+                        extra = int(descent * self.scale)
+                    except Exception:
+                        extra = 0
+                    pad = max(4, int(font_size * self.scale * 0.4) + extra)
+                    txt = Image.new("RGBA", (w + 2 * pad, h + 2 * pad), (0, 0, 0, 0))
+                    txt_draw = ImageDraw.Draw(txt)
+                    txt_draw.text((pad, pad), word, fill=color, font=font)
+                    rotated = txt.rotate(angle, expand=True, resample=Image.BICUBIC)
+                    rotated_mask = rotated.split()[-1]
+                    rotated_mask = rotated_mask.point(lambda v: 255 if v > 0 else 0)
+                    bbox_inner = rotated_mask.getbbox()
+                    if bbox_inner:
+                        rotated = rotated.crop(bbox_inner)
+                        rotated_mask = rotated_mask.crop(bbox_inner)
+                    if pad_box:
+                        rotated = ImageOps.expand(rotated, border=pad_box, fill=(0, 0, 0, 0))
+                        rotated_mask = ImageOps.expand(rotated_mask, border=pad_box, fill=0)
+                    img.paste(rotated, pos, rotated_mask)
+                elif isinstance(orientation, (int, np.integer)) or orientation is None:
+                    transposed_font = ImageFont.TransposedFont(
+                        font, orientation=orientation)
+                    if pad_box:
+                        draw.text((pos[0] + pad_box, pos[1] + pad_box), word, fill=color, font=transposed_font)
+                    else:
+                        draw.text(pos, word, fill=color, font=transposed_font)
+                else:
+                    # orientation is a float angle in degrees (add padding to avoid clipping)
+                    bbox = draw.textbbox((0, 0), word, font=font, anchor="lt")
+                    w = bbox[2] - bbox[0]
+                    h = bbox[3] - bbox[1]
+                    try:
+                        ascent, descent = font.getmetrics()
+                        extra = int(descent * self.scale)
+                    except Exception:
+                        extra = 0
+                    pad = max(4, int(font_size * self.scale * 0.4) + extra)
+                    txt = Image.new("RGBA", (w + 2 * pad, h + 2 * pad), (0, 0, 0, 0))
+                    txt_draw = ImageDraw.Draw(txt)
+                    txt_draw.text((pad, pad), word, fill=color, font=font)
+                    rotated = txt.rotate(orientation, expand=True, resample=Image.BICUBIC)
+                    img.paste(rotated, pos, rotated)
 
         return self._draw_contour(img=img)
+
+    def _render_layout_entry_rgba(self, word, font_size, orientation, color):
+        font = ImageFont.truetype(self.font_path, int(font_size * self.scale))
+        pad_box = int(self.box_padding * self.scale) if self.box_padding else 0
+        rgba = color if len(color) == 4 else tuple(color) + (255,)
+        if isinstance(orientation, (float, np.floating)):
+            angle = orientation
+            dummy = Image.new("RGBA", (1, 1), (0, 0, 0, 0))
+            dummy_draw = ImageDraw.Draw(dummy)
+            bbox = dummy_draw.textbbox((0, 0), word, font=font, anchor="lt")
+            w = bbox[2] - bbox[0]
+            h = bbox[3] - bbox[1]
+            try:
+                ascent, descent = font.getmetrics()
+                extra = int(descent * self.scale)
+            except Exception:
+                extra = 0
+            pad = max(4, int(font_size * self.scale * 0.4) + extra)
+            txt = Image.new("RGBA", (w + 2 * pad, h + 2 * pad), (0, 0, 0, 0))
+            txt_draw = ImageDraw.Draw(txt)
+            txt_draw.text((pad, pad), word, fill=rgba, font=font)
+            rotated = txt.rotate(angle, expand=True, resample=Image.BICUBIC)
+            rotated_mask = rotated.split()[-1].point(lambda v: 255 if v > 0 else 0)
+            bbox_inner = rotated_mask.getbbox()
+            if bbox_inner:
+                rotated = rotated.crop(bbox_inner)
+            if pad_box:
+                rotated = ImageOps.expand(rotated, border=pad_box, fill=(0, 0, 0, 0))
+            return rotated
+        if isinstance(orientation, (int, np.integer)) or orientation is None:
+            transposed_font = ImageFont.TransposedFont(font, orientation=orientation)
+            dummy = Image.new("RGBA", (1, 1), (0, 0, 0, 0))
+            dummy_draw = ImageDraw.Draw(dummy)
+            bbox = dummy_draw.textbbox((0, 0), word, font=transposed_font, anchor="lt")
+            w = max(1, bbox[2] - bbox[0])
+            h = max(1, bbox[3] - bbox[1])
+            txt = Image.new("RGBA", (w + 2 * pad_box, h + 2 * pad_box), (0, 0, 0, 0))
+            txt_draw = ImageDraw.Draw(txt)
+            txt_draw.text((pad_box - bbox[0], pad_box - bbox[1]), word, fill=rgba, font=transposed_font)
+            return txt
+        dummy = Image.new("RGBA", (1, 1), (0, 0, 0, 0))
+        dummy_draw = ImageDraw.Draw(dummy)
+        bbox = dummy_draw.textbbox((0, 0), word, font=font, anchor="lt")
+        w = bbox[2] - bbox[0]
+        h = bbox[3] - bbox[1]
+        try:
+            ascent, descent = font.getmetrics()
+            extra = int(descent * self.scale)
+        except Exception:
+            extra = 0
+        pad = max(4, int(font_size * self.scale * 0.4) + extra)
+        txt = Image.new("RGBA", (w + 2 * pad, h + 2 * pad), (0, 0, 0, 0))
+        txt_draw = ImageDraw.Draw(txt)
+        txt_draw.text((pad, pad), word, fill=rgba, font=font)
+        rotated = txt.rotate(orientation, expand=True, resample=Image.BICUBIC)
+        if pad_box:
+            rotated = ImageOps.expand(rotated, border=pad_box, fill=(0, 0, 0, 0))
+        return rotated
+
+    def to_image(self):
+        self._check_generated()
+        return self._layout_to_image(self.layout_)
+
+    def to_image_upto(self, n=None):
+        """Render only the first n placed words from the current layout."""
+        self._check_generated()
+        if n is None:
+            layout = self.layout_
+        else:
+            n = max(0, int(n))
+            layout = self.layout_[:n]
+        return self._layout_to_image(layout)
+
+    def to_image_layout(self, layout):
+        """Render an arbitrary layout slice/order from the current layout."""
+        self._check_generated()
+        return self._layout_to_image(layout)
+
+    def recolor_from_image(self, guide_image, mode="mean", background_color=None, alpha_by_word=None):
+        self._check_generated()
+        if mode not in ("center", "mean", "dominant"):
+            raise ValueError("mode must be one of: center, mean, dominant")
+        if self.mask is not None:
+            width = self.mask.shape[1]
+            height = self.mask.shape[0]
+        else:
+            height, width = self.height, self.width
+        render_size = (int(width * self.scale), int(height * self.scale))
+        guide = guide_image.convert("RGBA").resize(render_size, Image.LANCZOS)
+        guide_arr = np.asarray(guide)
+        bg_rgb = None
+        if background_color is not None:
+            bg_rgb = np.array(ImageColor.getrgb(background_color), dtype=float)
+            bg_luma = 0.2126 * bg_rgb[0] + 0.7152 * bg_rgb[1] + 0.0722 * bg_rgb[2]
+            contrast_fallback = np.array((0, 0, 0) if bg_luma >= 128 else (255, 255, 255), dtype=float)
+        else:
+            contrast_fallback = np.array((0, 0, 0), dtype=float)
+        new_layout = []
+        for (word_freq, font_size, position, orientation, color) in self.layout_:
+            word = word_freq[0]
+            stamp = self._render_layout_entry_rgba(word, font_size, orientation, (255, 255, 255, 255))
+            alpha = np.asarray(stamp.split()[-1])
+            pos = (int(position[1] * self.scale), int(position[0] * self.scale))
+            x0 = max(0, pos[0])
+            y0 = max(0, pos[1])
+            x1 = min(render_size[0], pos[0] + stamp.size[0])
+            y1 = min(render_size[1], pos[1] + stamp.size[1])
+            sampled_color = None
+            if x1 > x0 and y1 > y0:
+                ax0 = x0 - pos[0]
+                ay0 = y0 - pos[1]
+                ax1 = ax0 + (x1 - x0)
+                ay1 = ay0 + (y1 - y0)
+                alpha_crop = alpha[ay0:ay1, ax0:ax1]
+                guide_crop = guide_arr[y0:y1, x0:x1]
+                valid = alpha_crop > 0
+                if guide_crop.shape[2] == 4:
+                    valid &= guide_crop[:, :, 3] > 0
+                if valid.any():
+                    if mode == "center":
+                        ys, xs = np.where(valid)
+                        cy = int(np.round(ys.mean()))
+                        cx = int(np.round(xs.mean()))
+                        sampled_color = tuple(int(v) for v in guide_crop[cy, cx, :3])
+                    else:
+                        pixels = guide_crop[:, :, :3][valid]
+                        if mode == "mean":
+                            sampled_color = tuple(int(round(v)) for v in pixels.mean(axis=0))
+                        else:
+                            uniq, counts = np.unique(pixels, axis=0, return_counts=True)
+                            sampled_color = tuple(int(v) for v in uniq[counts.argmax()])
+            if sampled_color is None:
+                if isinstance(color, str):
+                    sampled_color = ImageColor.getrgb(color)
+                else:
+                    sampled_color = tuple(color[:3]) if len(color) >= 3 else tuple(color)
+            if bg_rgb is not None:
+                sampled_arr = np.array(sampled_color[:3], dtype=float)
+                if np.linalg.norm(sampled_arr - bg_rgb) < 40:
+                    sampled_color = tuple(int(v) for v in contrast_fallback)
+            if alpha_by_word is not None and background_color is not None:
+                blend_alpha = float(alpha_by_word.get(word, 1.0))
+                base_rgb = np.array(sampled_color[:3], dtype=float)
+                mixed_rgb = base_rgb * blend_alpha + bg_rgb * (1.0 - blend_alpha)
+                sampled_color = tuple(int(round(v)) for v in mixed_rgb)
+            new_layout.append((word_freq, font_size, position, orientation, sampled_color))
+        self.layout_ = new_layout
+        return self
+
+    def set_color_guide_fill(self, guide_image, alpha_by_word=None, blur_radius=0.0):
+        guide = guide_image.copy()
+        if blur_radius and blur_radius > 0:
+            guide = guide.filter(ImageFilter.GaussianBlur(radius=float(blur_radius)))
+        self.color_guide_fill_ = guide
+        self.color_guide_fill_alpha_by_word_ = alpha_by_word
+        return self
 
     def recolor(self, random_state=None, color_func=None, colormap=None):
         """Recolor existing layout.
